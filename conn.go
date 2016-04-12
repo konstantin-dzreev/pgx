@@ -37,6 +37,7 @@ type ConnConfig struct {
 	LogLevel          int
 	Dial              DialFunc
 	RuntimeParams     map[string]string // Run-time parameters to set on connection as session default values (e.g. search_path or application_name)
+	QueryExecTimeout  time.Duration     // Max query/statement execution time
 }
 
 // Conn is a PostgreSQL connection handle. It is not safe for concurrent usage.
@@ -164,6 +165,9 @@ func connect(config ConnConfig, pgTypes map[Oid]PgType, pgsql_af_inet *byte, pgs
 	if pgsql_af_inet6 != nil {
 		c.pgsql_af_inet6 = new(byte)
 		*c.pgsql_af_inet6 = *pgsql_af_inet6
+
+	if config.QueryExecTimeout < 0 {
+		return nil, errors.New("QueryExecTimeout must be equal to or greater than 0")
 	}
 
 	if c.config.LogLevel != 0 {
@@ -395,6 +399,46 @@ func (c *Conn) Close() (err error) {
 		c.log(LogLevelInfo, "Closed connection")
 	}
 	return err
+}
+
+// Kills current connection on the Postgres side.
+//
+// The method establishes a new connection to the DB and kills the orignal
+// connectiont.
+func (c *Conn) Kill() error {
+	if !c.IsAlive() {
+		return nil
+	}
+
+	killerConn, err := Connect(c.config)
+	if err != nil {
+		return err
+	}
+	defer killerConn.Close()
+
+	killerConn.config.QueryExecTimeout = 0
+	if _, err = killerConn.Exec("select pg_terminate_backend($1)", c.Pid); err != nil {
+		err = fmt.Errorf("Unable to kill backend PostgreSQL process: %v", err)
+	}
+
+	return err
+}
+
+// Starts a Query/Statement exec timeout if config.QueryExecTimeout is set.
+//
+// The timer should be stopped manually in the caller method to avoid false
+// timeout error to occur.
+//
+// FYI: Exec() and Query() may return different error messages:
+//   - conn.Exec():  "conn is dead"
+//   - conn.Query(): "FATAL: terminating connection due to administrator command (SQLSTATE 57P01)"
+func (c *Conn) startQueryExecTimeoutTimer() (timer *time.Timer) {
+	if c.config.QueryExecTimeout > 0 {
+		timer = time.AfterFunc(c.config.QueryExecTimeout, func() {
+			c.Kill()
+		})
+	}
+	return timer
 }
 
 // ParseURI parses a database URI into ConnConfig
@@ -963,6 +1007,11 @@ func (c *Conn) Exec(sql string, arguments ...interface{}) (commandTag CommandTag
 
 	startTime := time.Now()
 	c.lastActivityTime = startTime
+
+	// Set statement execution deadline
+	if timeoutTimer := c.startQueryExecTimeoutTimer(); timeoutTimer != nil {
+		defer timeoutTimer.Stop()
+	}
 
 	defer func() {
 		if err == nil {
