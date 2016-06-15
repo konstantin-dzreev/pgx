@@ -1533,6 +1533,11 @@ func TestExecWithQueryExecTimeoutSet(t *testing.T) {
 		t.Fatalf("Expected Exec to fail with timeout, instead it failed with '%v'", err)
 	}
 
+	// It should close the timed out connection
+	if !conn1.IsAlive() {
+		t.Fatal("Expected conn1.IsAlive to be false, instead it was true")
+	}
+
 	// case 2: big enough timeout that allows statement to finish.
 	config.QueryExecTimeout = 10 * time.Second
 	conn2 := mustConnect(t, config)

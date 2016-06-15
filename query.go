@@ -445,6 +445,13 @@ func (c *Conn) Query(sql string, args ...interface{}) (*Rows, error) {
 	}
 	rows.unlockConn = true
 
+	// Set query execution deadline.
+	// Do it before making any write attempts. Otherwise it may hang forever if
+	// there is a connection issue.
+	if timeoutTimer := c.startQueryExecTimeoutTimer(); timeoutTimer != nil {
+		defer timeoutTimer.Stop()
+	}
+
 	ps, ok := c.preparedStatements[sql]
 	if !ok {
 		var err error
@@ -453,11 +460,6 @@ func (c *Conn) Query(sql string, args ...interface{}) (*Rows, error) {
 			rows.abort(err)
 			return rows, rows.err
 		}
-	}
-
-	// Set query execution deadline
-	if timeoutTimer := c.startQueryExecTimeoutTimer(); timeoutTimer != nil {
-		defer timeoutTimer.Stop()
 	}
 
 	rows.fields = ps.FieldDescriptions
