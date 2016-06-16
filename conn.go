@@ -398,7 +398,17 @@ func (c *Conn) Kill() error {
 func (c *Conn) startQueryExecTimeoutTimer() (timer *time.Timer) {
 	if c.config.QueryExecTimeout > 0 {
 		timer = time.AfterFunc(c.config.QueryExecTimeout, func() {
-			c.Kill()
+			err := c.Kill()
+			// Close curent connection if Kill() happens to return an error.
+			// Most likely there was a low leven connection error.
+			if err != nil {
+				// To close current connection use c.die() instead of c.Close().
+				// C.Close() tries to rollback an openned transaction (if it is),
+				// but if there is a connection issue this may cause pgx code to hang
+				// until the remote host responds.
+				// C.die() does not do any high level voodoo, but closes the connection.
+				c.die(errors.New("QueryExecTimeout"))
+			}
 		})
 	}
 	return timer
