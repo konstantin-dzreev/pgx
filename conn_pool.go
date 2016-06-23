@@ -158,6 +158,10 @@ func (p *ConnPool) Release(conn *Conn) {
 	}
 	conn.notifications = nil
 
+	// Restore the original connection logger in case it was temporarily
+	// changed by QueryWithLogging or ExecWithLogging methods.
+	p.resetConnLogger(conn)
+
 	p.cond.L.Lock()
 
 	if conn.poolResetCount != p.resetCount {
@@ -269,11 +273,23 @@ func (p *ConnPool) createConnection() (*Conn, error) {
 
 // Exec acquires a connection, delegates the call to that connection, and releases the connection
 func (p *ConnPool) Exec(sql string, arguments ...interface{}) (commandTag CommandTag, err error) {
+	return p.ExecWithLogging(p.config.Logger, sql, arguments)
+}
+
+// ExecWithLogging Exec acquires a connection, changes connection logger to the
+// provided one, delegates the call to that connection, and releases the connection
+func (p *ConnPool) ExecWithLogging(logger Logger, sql string, arguments ...interface{}) (commandTag CommandTag, err error) {
+	// The method is a full copy of the standard p.Exec() method
+	// (except for the logger usage).
 	var c *Conn
 	if c, err = p.Acquire(); err != nil {
 		return
 	}
 	defer p.Release(c)
+
+	// Temporarily replace the default Connection logger with the provided one.
+	// The logger will be reset back to the default one when we do Release().
+	c.SetLogger(logger)
 
 	return c.Exec(sql, arguments...)
 }
@@ -281,11 +297,24 @@ func (p *ConnPool) Exec(sql string, arguments ...interface{}) (commandTag Comman
 // Query acquires a connection and delegates the call to that connection. When
 // *Rows are closed, the connection is released automatically.
 func (p *ConnPool) Query(sql string, args ...interface{}) (*Rows, error) {
+	return p.QueryWithLogging(p.config.Logger, sql, args)
+}
+
+// QueryWithLogging acquires a connection, changes its logger to the provided one
+// and delegates the call to that connection. When *Rows are closed, the connection
+// is released automatically.
+func (p *ConnPool) QueryWithLogging(logger Logger, sql string, args ...interface{}) (*Rows, error) {
+	// The method is a full copy of the original p.Query() method
+	// (except for the logger usage).
 	c, err := p.Acquire()
 	if err != nil {
 		// Because checking for errors can be deferred to the *Rows, build one with the error
 		return &Rows{closed: true, err: err}, err
 	}
+
+	// Temporarily replace the default Connection logger with the provided one.
+	// The logger will be reset back to the default one when we do Release().
+	c.SetLogger(logger)
 
 	rows, err := c.Query(sql, args...)
 	if err != nil {
@@ -406,4 +435,10 @@ func (p *ConnPool) txAfterClose(tx *Tx) {
 
 func (p *ConnPool) rowsAfterClose(rows *Rows) {
 	p.Release(rows.Conn())
+}
+
+// resetConnLogger Sets connection logger to its default value
+// (in case it was modified by QueryWithLogging or ExecWithLogging)
+func (p *ConnPool) resetConnLogger(c *Conn) {
+	c.SetLogger(c.config.Logger)
 }
