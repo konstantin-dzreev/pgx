@@ -53,6 +53,11 @@ type Rows struct {
 	closed     bool
 }
 
+// NewErroredRows builds Rows that represent the given error
+func NewErroredRows(err error) *Rows {
+	return &Rows{err: err, closed: true}
+}
+
 func (rows *Rows) FieldDescriptions() []FieldDescription {
 	return rows.fields
 }
