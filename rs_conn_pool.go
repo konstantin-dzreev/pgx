@@ -6,14 +6,7 @@ import (
 	"time"
 )
 
-type ConnPoolConfig struct {
-	ConnConfig
-	MaxConnections int               // max simultaneous connections to use, default 5, must be at least 2
-	AfterConnect   func(*Conn) error // function to call on every new connection
-	AcquireTimeout time.Duration     // max wait time when all connections are busy (0 means no timeout)
-}
-
-type ConnPool struct {
+type RsConnPool struct {
 	allConnections       []*Conn
 	availableConnections []*Conn
 	cond                 *sync.Cond
@@ -31,16 +24,10 @@ type ConnPool struct {
 	pgsql_af_inet6       *byte
 }
 
-type ConnPoolStat struct {
-	MaxConnections       int // max simultaneous connections to use
-	CurrentConnections   int // current live connections
-	AvailableConnections int // unused live connections
-}
-
-// NewConnPool creates a new ConnPool. config.ConnConfig is passed through to
+// NewRsConnPool creates a new RsConnPool. config.ConnConfig is passed through to
 // Connect directly.
-func NewConnPool(config ConnPoolConfig) (p *ConnPool, err error) {
-	p = new(ConnPool)
+func NewRsConnPool(config ConnPoolConfig) (p *RsConnPool, err error) {
+	p = new(RsConnPool)
 	p.config = config.ConnConfig
 	p.maxConnections = config.MaxConnections
 	if p.maxConnections == 0 {
@@ -85,7 +72,7 @@ func NewConnPool(config ConnPoolConfig) (p *ConnPool, err error) {
 }
 
 // Acquire takes exclusive use of a connection until it is released.
-func (p *ConnPool) Acquire() (*Conn, error) {
+func (p *RsConnPool) Acquire() (*Conn, error) {
 	p.cond.L.Lock()
 	c, err := p.acquire(nil)
 	p.cond.L.Unlock()
@@ -93,7 +80,7 @@ func (p *ConnPool) Acquire() (*Conn, error) {
 }
 
 // acquire performs acquision assuming pool is already locked
-func (p *ConnPool) acquire(deadline *time.Time) (*Conn, error) {
+func (p *RsConnPool) acquire(deadline *time.Time) (*Conn, error) {
 	if p.closed {
 		return nil, errors.New("cannot acquire from closed pool")
 	}
@@ -148,7 +135,7 @@ func (p *ConnPool) acquire(deadline *time.Time) (*Conn, error) {
 }
 
 // Release gives up use of a connection.
-func (p *ConnPool) Release(conn *Conn) {
+func (p *RsConnPool) Release(conn *Conn) {
 	if conn.TxStatus != 'I' {
 		conn.Exec("rollback")
 	}
@@ -189,7 +176,7 @@ func (p *ConnPool) Release(conn *Conn) {
 // Close ends the use of a connection pool. It prevents any new connections
 // from being acquired, waits until all acquired connections are released,
 // then closes all underlying connections.
-func (p *ConnPool) Close() {
+func (p *RsConnPool) Close() {
 	p.cond.L.Lock()
 	defer p.cond.L.Unlock()
 
@@ -213,7 +200,7 @@ func (p *ConnPool) Close() {
 //
 // It is safe to reset a pool while connections are checked out. Those
 // connections will be closed when they are returned to the pool.
-func (p *ConnPool) Reset() {
+func (p *RsConnPool) Reset() {
 	p.cond.L.Lock()
 	defer p.cond.L.Unlock()
 
@@ -224,7 +211,7 @@ func (p *ConnPool) Reset() {
 
 // invalidateAcquired causes all acquired connections to be closed when released.
 // The pool must already be locked.
-func (p *ConnPool) invalidateAcquired() {
+func (p *RsConnPool) invalidateAcquired() {
 	p.resetCount++
 
 	for _, c := range p.availableConnections {
@@ -236,7 +223,7 @@ func (p *ConnPool) invalidateAcquired() {
 }
 
 // Stat returns connection pool statistics
-func (p *ConnPool) Stat() (s ConnPoolStat) {
+func (p *RsConnPool) Stat() (s ConnPoolStat) {
 	p.cond.L.Lock()
 	defer p.cond.L.Unlock()
 
@@ -246,7 +233,7 @@ func (p *ConnPool) Stat() (s ConnPoolStat) {
 	return
 }
 
-func (p *ConnPool) createConnection() (*Conn, error) {
+func (p *RsConnPool) createConnection() (*Conn, error) {
 	c, err := connect(p.config, p.pgTypes, p.pgsql_af_inet, p.pgsql_af_inet6)
 	if err != nil {
 		return nil, err
@@ -275,7 +262,7 @@ func (p *ConnPool) createConnection() (*Conn, error) {
 }
 
 // Exec acquires a connection, delegates the call to that connection, and releases the connection
-func (p *ConnPool) Exec(sql string, arguments ...interface{}) (commandTag CommandTag, err error) {
+func (p *RsConnPool) Exec(sql string, arguments ...interface{}) (commandTag CommandTag, err error) {
 	var c *Conn
 	if c, err = p.Acquire(); err != nil {
 		return
@@ -287,7 +274,7 @@ func (p *ConnPool) Exec(sql string, arguments ...interface{}) (commandTag Comman
 
 // Query acquires a connection and delegates the call to that connection. When
 // *Rows are closed, the connection is released automatically.
-func (p *ConnPool) Query(sql string, args ...interface{}) (*Rows, error) {
+func (p *RsConnPool) Query(sql string, args ...interface{}) (*Rows, error) {
 	c, err := p.Acquire()
 	if err != nil {
 		// Because checking for errors can be deferred to the *Rows, build one with the error
@@ -308,14 +295,14 @@ func (p *ConnPool) Query(sql string, args ...interface{}) (*Rows, error) {
 // QueryRow acquires a connection and delegates the call to that connection. The
 // connection is released automatically after Scan is called on the returned
 // *Row.
-func (p *ConnPool) QueryRow(sql string, args ...interface{}) *Row {
+func (p *RsConnPool) QueryRow(sql string, args ...interface{}) *Row {
 	rows, _ := p.Query(sql, args...)
 	return (*Row)(rows)
 }
 
 // Begin acquires a connection and begins a transaction on it. When the
 // transaction is closed the connection will be automatically released.
-func (p *ConnPool) Begin() (*Tx, error) {
+func (p *RsConnPool) Begin() (*Tx, error) {
 	return p.BeginIso("")
 }
 
@@ -330,7 +317,7 @@ func (p *ConnPool) Begin() (*Tx, error) {
 // Prepare is idempotent; i.e. it is safe to call Prepare multiple times with
 // the same name and sql arguments. This allows a code path to Prepare and
 // Query/Exec/PrepareEx without concern for if the statement has already been prepared.
-func (p *ConnPool) Prepare(name, sql string) (*PreparedStatement, error) {
+func (p *RsConnPool) Prepare(name, sql string) (*PreparedStatement, error) {
 	return p.PrepareEx(name, sql, nil)
 }
 
@@ -345,7 +332,7 @@ func (p *ConnPool) Prepare(name, sql string) (*PreparedStatement, error) {
 // PrepareEx is idempotent; i.e. it is safe to call PrepareEx multiple times with the same
 // name and sql arguments. This allows a code path to PrepareEx and Query/Exec/Prepare without
 // concern for if the statement has already been prepared.
-func (p *ConnPool) PrepareEx(name, sql string, opts *PrepareExOptions) (*PreparedStatement, error) {
+func (p *RsConnPool) PrepareEx(name, sql string, opts *PrepareExOptions) (*PreparedStatement, error) {
 	p.cond.L.Lock()
 	defer p.cond.L.Unlock()
 
@@ -379,7 +366,7 @@ func (p *ConnPool) PrepareEx(name, sql string, opts *PrepareExOptions) (*Prepare
 }
 
 // Deallocate releases a prepared statement from all connections in the pool.
-func (p *ConnPool) Deallocate(name string) (err error) {
+func (p *RsConnPool) Deallocate(name string) (err error) {
 	p.cond.L.Lock()
 	defer p.cond.L.Unlock()
 
@@ -398,7 +385,7 @@ func (p *ConnPool) Deallocate(name string) (err error) {
 // BeginIso acquires a connection and begins a transaction in isolation mode iso
 // on it. When the transaction is closed the connection will be automatically
 // released.
-func (p *ConnPool) BeginIso(iso string) (*Tx, error) {
+func (p *RsConnPool) BeginIso(iso string) (*Tx, error) {
 	for {
 		c, err := p.Acquire()
 		if err != nil {
@@ -425,10 +412,10 @@ func (p *ConnPool) BeginIso(iso string) (*Tx, error) {
 	}
 }
 
-func (p *ConnPool) txAfterClose(tx *Tx) {
+func (p *RsConnPool) txAfterClose(tx *Tx) {
 	p.Release(tx.Conn())
 }
 
-func (p *ConnPool) rowsAfterClose(rows *Rows) {
+func (p *RsConnPool) rowsAfterClose(rows *Rows) {
 	p.Release(rows.Conn())
 }
