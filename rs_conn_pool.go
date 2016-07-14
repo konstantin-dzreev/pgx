@@ -17,7 +17,6 @@ type RsConnPool struct {
 	logger               Logger
 	logLevel             int
 	closed               bool
-	preparedStatements   map[string]*PreparedStatement
 	acquireTimeout       time.Duration
 	pgTypes              map[Oid]PgType
 	pgsql_af_inet        *byte
@@ -56,7 +55,6 @@ func NewRsConnPool(config ConnPoolConfig) (p *RsConnPool, err error) {
 
 	p.allConnections = make([]*Conn, 0, p.maxConnections)
 	p.availableConnections = make([]*Conn, 0, p.maxConnections)
-	p.preparedStatements = make(map[string]*PreparedStatement)
 	p.cond = sync.NewCond(new(sync.Mutex))
 
 	// Initially establish one connection
@@ -209,19 +207,6 @@ func (p *RsConnPool) Reset() {
 	p.availableConnections = make([]*Conn, 0, p.maxConnections)
 }
 
-// invalidateAcquired causes all acquired connections to be closed when released.
-// The pool must already be locked.
-func (p *RsConnPool) invalidateAcquired() {
-	p.resetCount++
-
-	for _, c := range p.availableConnections {
-		c.poolResetCount = p.resetCount
-	}
-
-	p.allConnections = p.allConnections[:len(p.availableConnections)]
-	copy(p.allConnections, p.availableConnections)
-}
-
 // Stat returns connection pool statistics
 func (p *RsConnPool) Stat() (s ConnPoolStat) {
 	p.cond.L.Lock()
@@ -246,13 +231,6 @@ func (p *RsConnPool) createConnection() (*Conn, error) {
 	if p.afterConnect != nil {
 		err = p.afterConnect(c)
 		if err != nil {
-			c.die(err)
-			return nil, err
-		}
-	}
-
-	for _, ps := range p.preparedStatements {
-		if _, err := c.Prepare(ps.Name, ps.SQL); err != nil {
 			c.die(err)
 			return nil, err
 		}
@@ -304,82 +282,6 @@ func (p *RsConnPool) QueryRow(sql string, args ...interface{}) *Row {
 // transaction is closed the connection will be automatically released.
 func (p *RsConnPool) Begin() (*Tx, error) {
 	return p.BeginIso("")
-}
-
-// Prepare creates a prepared statement on a connection in the pool to test the
-// statement is valid. If it succeeds all connections accessed through the pool
-// will have the statement available.
-//
-// Prepare creates a prepared statement with name and sql. sql can contain
-// placeholders for bound parameters. These placeholders are referenced
-// positional as $1, $2, etc.
-//
-// Prepare is idempotent; i.e. it is safe to call Prepare multiple times with
-// the same name and sql arguments. This allows a code path to Prepare and
-// Query/Exec/PrepareEx without concern for if the statement has already been prepared.
-func (p *RsConnPool) Prepare(name, sql string) (*PreparedStatement, error) {
-	return p.PrepareEx(name, sql, nil)
-}
-
-// PrepareEx creates a prepared statement on a connection in the pool to test the
-// statement is valid. If it succeeds all connections accessed through the pool
-// will have the statement available.
-//
-// PrepareEx creates a prepared statement with name and sql. sql can contain placeholders
-// for bound parameters. These placeholders are referenced positional as $1, $2, etc.
-// It defers from Prepare as it allows additional options (such as parameter OIDs) to be passed via struct
-//
-// PrepareEx is idempotent; i.e. it is safe to call PrepareEx multiple times with the same
-// name and sql arguments. This allows a code path to PrepareEx and Query/Exec/Prepare without
-// concern for if the statement has already been prepared.
-func (p *RsConnPool) PrepareEx(name, sql string, opts *PrepareExOptions) (*PreparedStatement, error) {
-	p.cond.L.Lock()
-	defer p.cond.L.Unlock()
-
-	if ps, ok := p.preparedStatements[name]; ok && ps.SQL == sql {
-		return ps, nil
-	}
-
-	c, err := p.acquire(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	ps, err := c.PrepareEx(name, sql, opts)
-
-	p.availableConnections = append(p.availableConnections, c)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, c := range p.availableConnections {
-		_, err := c.PrepareEx(name, sql, opts)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	p.invalidateAcquired()
-	p.preparedStatements[name] = ps
-
-	return ps, err
-}
-
-// Deallocate releases a prepared statement from all connections in the pool.
-func (p *RsConnPool) Deallocate(name string) (err error) {
-	p.cond.L.Lock()
-	defer p.cond.L.Unlock()
-
-	for _, c := range p.availableConnections {
-		if err := c.Deallocate(name); err != nil {
-			return err
-		}
-	}
-
-	p.invalidateAcquired()
-	delete(p.preparedStatements, name)
-
-	return nil
 }
 
 // BeginIso acquires a connection and begins a transaction in isolation mode iso
