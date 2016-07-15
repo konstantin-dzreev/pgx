@@ -3,6 +3,7 @@ package pgx_test
 import (
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -10,16 +11,16 @@ import (
 	"github.com/jackc/pgx"
 )
 
-func createConnPool(t *testing.T, maxConnections int) *pgx.ConnPool {
+func createRsConnPool(t *testing.T, maxConnections int) *pgx.RsConnPool {
 	config := pgx.ConnPoolConfig{ConnConfig: *defaultConnConfig, MaxConnections: maxConnections}
-	pool, err := pgx.NewConnPool(config)
+	pool, err := pgx.NewRsConnPool(config)
 	if err != nil {
 		t.Fatalf("Unable to create connection pool: %v", err)
 	}
 	return pool
 }
 
-func acquireAllConnections(t *testing.T, pool *pgx.ConnPool, maxConnections int) []*pgx.Conn {
+func acquireAllRsConnPoolConnections(t *testing.T, pool *pgx.RsConnPool, maxConnections int) []*pgx.Conn {
 	connections := make([]*pgx.Conn, maxConnections)
 	for i := 0; i < maxConnections; i++ {
 		var err error
@@ -30,19 +31,19 @@ func acquireAllConnections(t *testing.T, pool *pgx.ConnPool, maxConnections int)
 	return connections
 }
 
-func releaseAllConnections(pool *pgx.ConnPool, connections []*pgx.Conn) {
+func releaseAllRsConnPoolConnections(pool *pgx.RsConnPool, connections []*pgx.Conn) {
 	for _, c := range connections {
 		pool.Release(c)
 	}
 }
 
-func acquireWithTimeTaken(pool *pgx.ConnPool) (*pgx.Conn, time.Duration, error) {
+func acquireRsConnPoolWithTimeTaken(pool *pgx.RsConnPool) (*pgx.Conn, time.Duration, error) {
 	startTime := time.Now()
 	c, err := pool.Acquire()
 	return c, time.Now().Sub(startTime), err
 }
 
-func TestNewConnPool(t *testing.T) {
+func TestNewRsConnPool(t *testing.T) {
 	t.Parallel()
 
 	var numCallbacks int
@@ -52,7 +53,7 @@ func TestNewConnPool(t *testing.T) {
 	}
 
 	config := pgx.ConnPoolConfig{ConnConfig: *defaultConnConfig, MaxConnections: 2, AfterConnect: afterConnect}
-	pool, err := pgx.NewConnPool(config)
+	pool, err := pgx.NewRsConnPool(config)
 	if err != nil {
 		t.Fatal("Unable to establish connection pool")
 	}
@@ -71,17 +72,17 @@ func TestNewConnPool(t *testing.T) {
 	}
 
 	config = pgx.ConnPoolConfig{ConnConfig: *defaultConnConfig, MaxConnections: 2, AfterConnect: afterConnect}
-	pool, err = pgx.NewConnPool(config)
+	pool, err = pgx.NewRsConnPool(config)
 	if err != errAfterConnect {
 		t.Errorf("Expected errAfterConnect but received unexpected: %v", err)
 	}
 }
 
-func TestNewConnPoolDefaultsTo5MaxConnections(t *testing.T) {
+func TestNewRsConnPoolDefaultsTo5MaxConnections(t *testing.T) {
 	t.Parallel()
 
 	config := pgx.ConnPoolConfig{ConnConfig: *defaultConnConfig}
-	pool, err := pgx.NewConnPool(config)
+	pool, err := pgx.NewRsConnPool(config)
 	if err != nil {
 		t.Fatal("Unable to establish connection pool")
 	}
@@ -92,23 +93,23 @@ func TestNewConnPoolDefaultsTo5MaxConnections(t *testing.T) {
 	}
 }
 
-func TestPoolAcquireAndReleaseCycle(t *testing.T) {
+func TestRsConnPoolAcquireAndReleaseCycle(t *testing.T) {
 	t.Parallel()
 
 	maxConnections := 2
 	incrementCount := int32(100)
 	completeSync := make(chan int)
-	pool := createConnPool(t, maxConnections)
+	pool := createRsConnPool(t, maxConnections)
 	defer pool.Close()
 
-	allConnections := acquireAllConnections(t, pool, maxConnections)
+	allConnections := acquireAllRsConnPoolConnections(t, pool, maxConnections)
 
 	for _, c := range allConnections {
 		mustExec(t, c, "create temporary table t(counter integer not null)")
 		mustExec(t, c, "insert into t(counter) values(0);")
 	}
 
-	releaseAllConnections(pool, allConnections)
+	releaseAllRsConnPoolConnections(pool, allConnections)
 
 	f := func() {
 		conn, err := pool.Acquire()
@@ -133,7 +134,7 @@ func TestPoolAcquireAndReleaseCycle(t *testing.T) {
 
 	// Check that temp table in each connection has been incremented some number of times
 	actualCount := int32(0)
-	allConnections = acquireAllConnections(t, pool, maxConnections)
+	allConnections = acquireAllRsConnPoolConnections(t, pool, maxConnections)
 
 	for _, c := range allConnections {
 		var n int32
@@ -150,10 +151,55 @@ func TestPoolAcquireAndReleaseCycle(t *testing.T) {
 		t.Error("Wrong number of increments")
 	}
 
-	releaseAllConnections(pool, allConnections)
+	releaseAllRsConnPoolConnections(pool, allConnections)
 }
 
-func TestAcquireTimeoutSanity(t *testing.T) {
+func TestRsConnPoolNonBlockingConections(t *testing.T) {
+	t.Parallel()
+
+	maxConnections := 5
+	openTimeout := 1 * time.Second
+	dialer := net.Dialer{
+		Timeout: openTimeout,
+	}
+	config := pgx.ConnPoolConfig{
+		ConnConfig:     *defaultConnConfig,
+		MaxConnections: maxConnections,
+	}
+	config.ConnConfig.Dial = dialer.Dial
+	// We need a server that would silently DROP all incoming requests.
+	// P.S. I bet there is something better than microsoft.com that does this...
+	config.Host = "microsoft.com"
+
+	pool, err := pgx.NewRsConnPool(config)
+	if err == nil {
+		t.Fatalf("Expected NewRsConnPool not to fail, instead it failed with")
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(maxConnections)
+
+	startedAt := time.Now()
+	for i := 0; i < maxConnections; i++ {
+		go func() {
+			_, err := pool.Acquire()
+			wg.Done()
+			if err == nil {
+				t.Fatal("RsConnPool.Acquire() expected to fail but it did not")
+			}
+		}()
+	}
+	wg.Wait()
+
+	timeTaken := time.Now().Sub(startedAt)
+	if timeTaken > openTimeout+1*time.Second {
+		t.Fatalf("Expected all RsConnPool.Aquire() to run in paralles and take about %v, instead it took '%v'", openTimeout, timeTaken)
+	}
+
+	defer pool.Close()
+}
+
+func TestRsConnAcquireTimeoutSanity(t *testing.T) {
 	t.Parallel()
 
 	config := pgx.ConnPoolConfig{
@@ -162,29 +208,29 @@ func TestAcquireTimeoutSanity(t *testing.T) {
 	}
 
 	// case 1: default 0 value
-	pool, err := pgx.NewConnPool(config)
+	pool, err := pgx.NewRsConnPool(config)
 	if err != nil {
-		t.Fatalf("Expected NewConnPool with default config.AcquireTimeout not to fail, instead it failed with '%v'", err)
+		t.Fatalf("Expected NewRsConnPool with default config.AcquireTimeout not to fail, instead it failed with '%v'", err)
 	}
 	pool.Close()
 
 	// case 2: negative value
 	config.AcquireTimeout = -1 * time.Second
-	_, err = pgx.NewConnPool(config)
+	_, err = pgx.NewRsConnPool(config)
 	if err == nil {
-		t.Fatal("Expected NewConnPool with negative config.AcquireTimeout to fail, instead it did not")
+		t.Fatal("Expected NewRsConnPool with negative config.AcquireTimeout to fail, instead it did not")
 	}
 
 	// case 3: positive value
 	config.AcquireTimeout = 1 * time.Second
-	pool, err = pgx.NewConnPool(config)
+	pool, err = pgx.NewRsConnPool(config)
 	if err != nil {
-		t.Fatalf("Expected NewConnPool with positive config.AcquireTimeout not to fail, instead it failed with '%v'", err)
+		t.Fatalf("Expected NewRsConnPool with positive config.AcquireTimeout not to fail, instead it failed with '%v'", err)
 	}
 	defer pool.Close()
 }
 
-func TestPoolWithAcquireTimeoutSet(t *testing.T) {
+func TestRsConnPoolWithAcquireTimeoutSet(t *testing.T) {
 	t.Parallel()
 
 	connAllocTimeout := 2 * time.Second
@@ -194,18 +240,18 @@ func TestPoolWithAcquireTimeoutSet(t *testing.T) {
 		AcquireTimeout: connAllocTimeout,
 	}
 
-	pool, err := pgx.NewConnPool(config)
+	pool, err := pgx.NewRsConnPool(config)
 	if err != nil {
 		t.Fatalf("Unable to create connection pool: %v", err)
 	}
 	defer pool.Close()
 
 	// Consume all connections ...
-	allConnections := acquireAllConnections(t, pool, config.MaxConnections)
-	defer releaseAllConnections(pool, allConnections)
+	allConnections := acquireAllRsConnPoolConnections(t, pool, config.MaxConnections)
+	defer releaseAllRsConnPoolConnections(pool, allConnections)
 
 	// ... then try to consume 1 more. It should fail after a short timeout.
-	_, timeTaken, err := acquireWithTimeTaken(pool)
+	_, timeTaken, err := acquireRsConnPoolWithTimeTaken(pool)
 
 	if err == nil || err.Error() != "Timeout: All connections in pool are busy" {
 		t.Fatalf("Expected error to be 'Timeout: All connections in pool are busy', instead it was '%v'", err)
@@ -215,25 +261,25 @@ func TestPoolWithAcquireTimeoutSet(t *testing.T) {
 	}
 }
 
-func TestPoolWithoutAcquireTimeoutSet(t *testing.T) {
+func TestRsConnPoolWithoutAcquireTimeoutSet(t *testing.T) {
 	t.Parallel()
 
 	maxConnections := 1
-	pool := createConnPool(t, maxConnections)
+	pool := createRsConnPool(t, maxConnections)
 	defer pool.Close()
 
 	// Consume all connections ...
-	allConnections := acquireAllConnections(t, pool, maxConnections)
+	allConnections := acquireAllRsConnPoolConnections(t, pool, maxConnections)
 
 	// ... then try to consume 1 more. It should hang forever.
 	// To unblock it we release the previously taken connection in a goroutine.
 	stopDeadWaitTimeout := 5 * time.Second
 	timer := time.AfterFunc(stopDeadWaitTimeout, func() {
-		releaseAllConnections(pool, allConnections)
+		releaseAllRsConnPoolConnections(pool, allConnections)
 	})
 	defer timer.Stop()
 
-	conn, timeTaken, err := acquireWithTimeTaken(pool)
+	conn, timeTaken, err := acquireRsConnPoolWithTimeTaken(pool)
 	if err == nil {
 		pool.Release(conn)
 	} else {
@@ -244,10 +290,10 @@ func TestPoolWithoutAcquireTimeoutSet(t *testing.T) {
 	}
 }
 
-func TestPoolReleaseWithTransactions(t *testing.T) {
+func TestRsConnPoolReleaseWithTransactions(t *testing.T) {
 	t.Parallel()
 
-	pool := createConnPool(t, 2)
+	pool := createRsConnPool(t, 2)
 	defer pool.Close()
 
 	conn, err := pool.Acquire()
@@ -285,11 +331,11 @@ func TestPoolReleaseWithTransactions(t *testing.T) {
 	}
 }
 
-func TestPoolAcquireAndReleaseCycleAutoConnect(t *testing.T) {
+func TestRsConnPoolAcquireAndReleaseCycleAutoConnect(t *testing.T) {
 	t.Parallel()
 
 	maxConnections := 3
-	pool := createConnPool(t, maxConnections)
+	pool := createRsConnPool(t, maxConnections)
 	defer pool.Close()
 
 	doSomething := func() {
@@ -327,14 +373,14 @@ func TestPoolAcquireAndReleaseCycleAutoConnect(t *testing.T) {
 	}
 }
 
-func TestPoolReleaseDiscardsDeadConnections(t *testing.T) {
+func TestRsConnPoolReleaseDiscardsDeadConnections(t *testing.T) {
 	t.Parallel()
 
 	// Run timing sensitive test many times
 	for i := 0; i < 50; i++ {
 		func() {
 			maxConnections := 3
-			pool := createConnPool(t, maxConnections)
+			pool := createRsConnPool(t, maxConnections)
 			defer pool.Close()
 
 			var c1, c2 *pgx.Conn
@@ -396,10 +442,10 @@ func TestPoolReleaseDiscardsDeadConnections(t *testing.T) {
 	}
 }
 
-func TestConnPoolReset(t *testing.T) {
+func TestRsConnPoolReset(t *testing.T) {
 	t.Parallel()
 
-	pool := createConnPool(t, 5)
+	pool := createRsConnPool(t, 5)
 	defer pool.Close()
 
 	inProgressRows := []*pgx.Rows{}
@@ -443,10 +489,10 @@ func TestConnPoolReset(t *testing.T) {
 	}
 }
 
-func TestConnPoolTransaction(t *testing.T) {
+func TestRsConnPoolTransaction(t *testing.T) {
 	t.Parallel()
 
-	pool := createConnPool(t, 2)
+	pool := createRsConnPool(t, 2)
 	defer pool.Close()
 
 	stats := pool.Stat()
@@ -485,10 +531,10 @@ func TestConnPoolTransaction(t *testing.T) {
 	}
 }
 
-func TestConnPoolTransactionIso(t *testing.T) {
+func TestRsConnPoolTransactionIso(t *testing.T) {
 	t.Parallel()
 
-	pool := createConnPool(t, 2)
+	pool := createRsConnPool(t, 2)
 	defer pool.Close()
 
 	tx, err := pool.BeginIso(pgx.Serializable)
@@ -508,13 +554,13 @@ func TestConnPoolTransactionIso(t *testing.T) {
 	}
 }
 
-func TestConnPoolBeginRetry(t *testing.T) {
+func TestRsConnPoolBeginRetry(t *testing.T) {
 	t.Parallel()
 
 	// Run timing sensitive test many times
 	for i := 0; i < 50; i++ {
 		func() {
-			pool := createConnPool(t, 2)
+			pool := createRsConnPool(t, 2)
 			defer pool.Close()
 
 			killerConn, err := pool.Acquire()
@@ -554,10 +600,10 @@ func TestConnPoolBeginRetry(t *testing.T) {
 	}
 }
 
-func TestConnPoolQuery(t *testing.T) {
+func TestRsConnPoolQuery(t *testing.T) {
 	t.Parallel()
 
-	pool := createConnPool(t, 2)
+	pool := createRsConnPool(t, 2)
 	defer pool.Close()
 
 	var sum, rowCount int32
@@ -596,10 +642,10 @@ func TestConnPoolQuery(t *testing.T) {
 	}
 }
 
-func TestConnPoolQueryConcurrentLoad(t *testing.T) {
+func TestRsConnPoolQueryConcurrentLoad(t *testing.T) {
 	t.Parallel()
 
-	pool := createConnPool(t, 10)
+	pool := createRsConnPool(t, 10)
 	defer pool.Close()
 
 	n := 100
@@ -648,10 +694,10 @@ func TestConnPoolQueryConcurrentLoad(t *testing.T) {
 	}
 }
 
-func TestConnPoolQueryRow(t *testing.T) {
+func TestRsConnPoolQueryRow(t *testing.T) {
 	t.Parallel()
 
-	pool := createConnPool(t, 2)
+	pool := createRsConnPool(t, 2)
 	defer pool.Close()
 
 	var n int32
@@ -670,10 +716,10 @@ func TestConnPoolQueryRow(t *testing.T) {
 	}
 }
 
-func TestConnPoolExec(t *testing.T) {
+func TestRsConnPoolExec(t *testing.T) {
 	t.Parallel()
 
-	pool := createConnPool(t, 2)
+	pool := createRsConnPool(t, 2)
 	defer pool.Close()
 
 	results, err := pool.Exec("create temporary table foo(id integer primary key);")
@@ -698,141 +744,5 @@ func TestConnPoolExec(t *testing.T) {
 	}
 	if results != "DROP TABLE" {
 		t.Errorf("Unexpected results from Exec: %v", results)
-	}
-}
-
-func TestConnPoolPrepare(t *testing.T) {
-	t.Parallel()
-
-	pool := createConnPool(t, 2)
-	defer pool.Close()
-
-	_, err := pool.Prepare("test", "select $1::varchar")
-	if err != nil {
-		t.Fatalf("Unable to prepare statement: %v", err)
-	}
-
-	var s string
-	err = pool.QueryRow("test", "hello").Scan(&s)
-	if err != nil {
-		t.Errorf("Executing prepared statement failed: %v", err)
-	}
-
-	if s != "hello" {
-		t.Errorf("Prepared statement did not return expected value: %v", s)
-	}
-
-	err = pool.Deallocate("test")
-	if err != nil {
-		t.Errorf("Deallocate failed: %v", err)
-	}
-
-	err = pool.QueryRow("test", "hello").Scan(&s)
-	if err, ok := err.(pgx.PgError); !(ok && err.Code == "42601") {
-		t.Errorf("Expected error calling deallocated prepared statement, but got: %v", err)
-	}
-}
-
-func TestConnPoolPrepareDeallocatePrepare(t *testing.T) {
-	t.Parallel()
-
-	pool := createConnPool(t, 2)
-	defer pool.Close()
-
-	_, err := pool.Prepare("test", "select $1::varchar")
-	if err != nil {
-		t.Fatalf("Unable to prepare statement: %v", err)
-	}
-	err = pool.Deallocate("test")
-	if err != nil {
-		t.Fatalf("Unable to deallocate statement: %v", err)
-	}
-	_, err = pool.Prepare("test", "select $1::varchar")
-	if err != nil {
-		t.Fatalf("Unable to prepare statement: %v", err)
-	}
-
-	var s string
-	err = pool.QueryRow("test", "hello").Scan(&s)
-	if err != nil {
-		t.Fatalf("Executing prepared statement failed: %v", err)
-	}
-
-	if s != "hello" {
-		t.Errorf("Prepared statement did not return expected value: %v", s)
-	}
-}
-
-func TestConnPoolPrepareWhenConnIsAlreadyAcquired(t *testing.T) {
-	t.Parallel()
-
-	pool := createConnPool(t, 2)
-	defer pool.Close()
-
-	testPreparedStatement := func(db queryRower, desc string) {
-		var s string
-		err := db.QueryRow("test", "hello").Scan(&s)
-		if err != nil {
-			t.Fatalf("%s. Executing prepared statement failed: %v", desc, err)
-		}
-
-		if s != "hello" {
-			t.Fatalf("%s. Prepared statement did not return expected value: %v", desc, s)
-		}
-	}
-
-	newReleaseOnce := func(c *pgx.Conn) func() {
-		var once sync.Once
-		return func() {
-			once.Do(func() { pool.Release(c) })
-		}
-	}
-
-	c1, err := pool.Acquire()
-	if err != nil {
-		t.Fatalf("Unable to acquire connection: %v", err)
-	}
-	c1Release := newReleaseOnce(c1)
-	defer c1Release()
-
-	_, err = pool.Prepare("test", "select $1::varchar")
-	if err != nil {
-		t.Fatalf("Unable to prepare statement: %v", err)
-	}
-
-	testPreparedStatement(pool, "pool")
-
-	c1Release()
-
-	c2, err := pool.Acquire()
-	if err != nil {
-		t.Fatalf("Unable to acquire connection: %v", err)
-	}
-	c2Release := newReleaseOnce(c2)
-	defer c2Release()
-
-	// This conn will not be available and will be connection at this point
-	c3, err := pool.Acquire()
-	if err != nil {
-		t.Fatalf("Unable to acquire connection: %v", err)
-	}
-	c3Release := newReleaseOnce(c3)
-	defer c3Release()
-
-	testPreparedStatement(c2, "c2")
-	testPreparedStatement(c3, "c3")
-
-	c2Release()
-	c3Release()
-
-	err = pool.Deallocate("test")
-	if err != nil {
-		t.Errorf("Deallocate failed: %v", err)
-	}
-
-	var s string
-	err = pool.QueryRow("test", "hello").Scan(&s)
-	if err, ok := err.(pgx.PgError); !(ok && err.Code == "42601") {
-		t.Errorf("Expected error calling deallocated prepared statement, but got: %v", err)
 	}
 }

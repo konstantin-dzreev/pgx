@@ -1,12 +1,14 @@
 package pgx_test
 
 import (
-	"github.com/jackc/pgx"
+	"bytes"
 	"net"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx"
 )
 
 func TestDateTranscode(t *testing.T) {
@@ -195,7 +197,7 @@ func testJsonInt16ArrayFailureDueToOverflow(t *testing.T, conn *pgx.Conn, typena
 	input := []int{1, 2, 234432}
 	var output []int16
 	err := conn.QueryRow("select $1::"+typename, input).Scan(&output)
-	if err.Error() != "can't scan into dest[0]: json: cannot unmarshal number 234432 into Go value of type int16" {
+	if err == nil || err.Error() != "can't scan into dest[0]: json: cannot unmarshal number 234432 into Go value of type int16" {
 		t.Errorf("%s: Expected *json.UnmarkalTypeError, but got %v", typename, err)
 	}
 }
@@ -258,7 +260,7 @@ func TestStringToNotTextTypeTranscode(t *testing.T) {
 	}
 }
 
-func TestInetCidrTranscode(t *testing.T) {
+func TestInetCidrTranscodeIPNet(t *testing.T) {
 	t.Parallel()
 
 	conn := mustConnect(t, *defaultConnConfig)
@@ -307,7 +309,67 @@ func TestInetCidrTranscode(t *testing.T) {
 	}
 }
 
-func TestInetCidrArrayTranscode(t *testing.T) {
+func TestInetCidrTranscodeIP(t *testing.T) {
+	t.Parallel()
+
+	conn := mustConnect(t, *defaultConnConfig)
+	defer closeConn(t, conn)
+
+	tests := []struct {
+		sql   string
+		value net.IP
+	}{
+		{"select $1::inet", net.ParseIP("0.0.0.0")},
+		{"select $1::inet", net.ParseIP("127.0.0.1")},
+		{"select $1::inet", net.ParseIP("12.34.56.0")},
+		{"select $1::inet", net.ParseIP("255.255.255.255")},
+		{"select $1::inet", net.ParseIP("::1")},
+		{"select $1::inet", net.ParseIP("2607:f8b0:4009:80b::200e")},
+		{"select $1::cidr", net.ParseIP("0.0.0.0")},
+		{"select $1::cidr", net.ParseIP("127.0.0.1")},
+		{"select $1::cidr", net.ParseIP("12.34.56.0")},
+		{"select $1::cidr", net.ParseIP("255.255.255.255")},
+		{"select $1::cidr", net.ParseIP("::1")},
+		{"select $1::cidr", net.ParseIP("2607:f8b0:4009:80b::200e")},
+	}
+
+	for i, tt := range tests {
+		var actual net.IP
+
+		err := conn.QueryRow(tt.sql, tt.value).Scan(&actual)
+		if err != nil {
+			t.Errorf("%d. Unexpected failure: %v (sql -> %v, value -> %v)", i, err, tt.sql, tt.value)
+			continue
+		}
+
+		if !actual.Equal(tt.value) {
+			t.Errorf("%d. Expected %v, got %v (sql -> %v)", i, tt.value, actual, tt.sql)
+		}
+
+		ensureConnValid(t, conn)
+	}
+
+	failTests := []struct {
+		sql   string
+		value net.IPNet
+	}{
+		{"select $1::inet", mustParseCIDR(t, "192.168.1.0/24")},
+		{"select $1::cidr", mustParseCIDR(t, "192.168.1.0/24")},
+	}
+	for i, tt := range failTests {
+		var actual net.IP
+
+		err := conn.QueryRow(tt.sql, tt.value).Scan(&actual)
+		if !strings.Contains(err.Error(), "Cannot decode netmask") {
+			t.Errorf("%d. Expected failure cannot decode netmask, but got: %v (sql -> %v, value -> %v)", i, err, tt.sql, tt.value)
+			continue
+		}
+
+		ensureConnValid(t, conn)
+	}
+}
+
+func TestInetCidrArrayTranscodeIPNet(t *testing.T) {
 	t.Parallel()
 
 	conn := mustConnect(t, *defaultConnConfig)
@@ -360,6 +422,87 @@ func TestInetCidrArrayTranscode(t *testing.T) {
 
 		if !reflect.DeepEqual(actual, tt.value) {
 			t.Errorf("%d. Expected %v, got %v (sql -> %v)", i, tt.value, actual, tt.sql)
+		}
+
+		ensureConnValid(t, conn)
+	}
+}
+
+func TestInetCidrArrayTranscodeIP(t *testing.T) {
+	t.Parallel()
+
+	conn := mustConnect(t, *defaultConnConfig)
+	defer closeConn(t, conn)
+
+	tests := []struct {
+		sql   string
+		value []net.IP
+	}{
+		{
+			"select $1::inet[]",
+			[]net.IP{
+				net.ParseIP("0.0.0.0"),
+				net.ParseIP("127.0.0.1"),
+				net.ParseIP("12.34.56.0"),
+				net.ParseIP("255.255.255.255"),
+				net.ParseIP("2607:f8b0:4009:80b::200e"),
+			},
+		},
+		{
+			"select $1::cidr[]",
+			[]net.IP{
+				net.ParseIP("0.0.0.0"),
+				net.ParseIP("127.0.0.1"),
+				net.ParseIP("12.34.56.0"),
+				net.ParseIP("255.255.255.255"),
+				net.ParseIP("2607:f8b0:4009:80b::200e"),
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		var actual []net.IP
+
+		err := conn.QueryRow(tt.sql, tt.value).Scan(&actual)
+		if err != nil {
+			t.Errorf("%d. Unexpected failure: %v (sql -> %v, value -> %v)", i, err, tt.sql, tt.value)
+			continue
+		}
+
+		if !reflect.DeepEqual(actual, tt.value) {
+			t.Errorf("%d. Expected %v, got %v (sql -> %v)", i, tt.value, actual, tt.sql)
+		}
+
+		ensureConnValid(t, conn)
+	}
+
+	failTests := []struct {
+		sql   string
+		value []net.IPNet
+	}{
+		{
+			"select $1::inet[]",
+			[]net.IPNet{
+				mustParseCIDR(t, "12.34.56.0/32"),
+				mustParseCIDR(t, "192.168.1.0/24"),
+			},
+		},
+		{
+			"select $1::cidr[]",
+			[]net.IPNet{
+				mustParseCIDR(t, "12.34.56.0/32"),
+				mustParseCIDR(t, "192.168.1.0/24"),
+			},
+		},
+	}
+
+	for i, tt := range failTests {
+		var actual []net.IP
+
+		err := conn.QueryRow(tt.sql, tt.value).Scan(&actual)
+		if err == nil || !strings.Contains(err.Error(), "Cannot decode netmask") {
+			t.Errorf("%d. Expected failure cannot decode netmask, but got: %v (sql -> %v, value -> %v)", i, err, tt.sql, tt.value)
+			continue
 		}
 
 		ensureConnValid(t, conn)
@@ -564,12 +707,30 @@ func TestArrayDecoding(t *testing.T) {
 				}
 			},
 		},
+		{
+			"select $1::bytea[]", [][]byte{{0, 1, 2, 3}, {4, 5, 6, 7}}, &[][]byte{},
+			func(t *testing.T, query, scan interface{}) {
+				queryBytesSliceSlice := query.([][]byte)
+				scanBytesSliceSlice := *(scan.(*[][]byte))
+				if len(queryBytesSliceSlice) != len(scanBytesSliceSlice) {
+					t.Errorf("failed to encode byte[][] to bytea[]: expected %d to equal %d", len(queryBytesSliceSlice), len(scanBytesSliceSlice))
+				}
+				for i := range queryBytesSliceSlice {
+					qb := queryBytesSliceSlice[i]
+					sb := scanBytesSliceSlice[i]
+					if bytes.Compare(qb, sb) != 0 {
+						t.Errorf("failed to encode byte[][] to bytea[]: expected %v to equal %v", qb, sb)
+					}
+				}
+			},
+		},
 	}
 
 	for i, tt := range tests {
 		err := conn.QueryRow(tt.sql, tt.query).Scan(tt.scan)
 		if err != nil {
 			t.Errorf(`%d. error reading array: %v`, i, err)
+			continue
 		}
 		tt.assert(t, tt.query, tt.scan)
 		ensureConnValid(t, conn)
@@ -796,5 +957,146 @@ func TestPointerPointerNonZero(t *testing.T) {
 	}
 	if dest != nil {
 		t.Errorf("Expected dest to be nil, got %#v", dest)
+	}
+}
+
+func TestEncodeTypeRename(t *testing.T) {
+	t.Parallel()
+
+	conn := mustConnect(t, *defaultConnConfig)
+	defer closeConn(t, conn)
+
+	type _int int
+	inInt := _int(3)
+	var outInt _int
+
+	type _int8 int8
+	inInt8 := _int8(3)
+	var outInt8 _int8
+
+	type _int16 int16
+	inInt16 := _int16(3)
+	var outInt16 _int16
+
+	type _int32 int32
+	inInt32 := _int32(4)
+	var outInt32 _int32
+
+	type _int64 int64
+	inInt64 := _int64(5)
+	var outInt64 _int64
+
+	type _uint uint
+	inUint := _uint(6)
+	var outUint _uint
+
+	type _uint8 uint8
+	inUint8 := _uint8(7)
+	var outUint8 _uint8
+
+	type _uint16 uint16
+	inUint16 := _uint16(8)
+	var outUint16 _uint16
+
+	type _uint32 uint32
+	inUint32 := _uint32(9)
+	var outUint32 _uint32
+
+	type _uint64 uint64
+	inUint64 := _uint64(10)
+	var outUint64 _uint64
+
+	type _string string
+	inString := _string("foo")
+	var outString _string
+
+	err := conn.QueryRow("select $1::int, $2::int, $3::int2, $4::int4, $5::int8, $6::int, $7::int, $8::int, $9::int, $10::int, $11::text",
+		inInt, inInt8, inInt16, inInt32, inInt64, inUint, inUint8, inUint16, inUint32, inUint64, inString,
+	).Scan(&outInt, &outInt8, &outInt16, &outInt32, &outInt64, &outUint, &outUint8, &outUint16, &outUint32, &outUint64, &outString)
+	if err != nil {
+		t.Fatalf("Failed with type rename: %v", err)
+	}
+
+	if inInt != outInt {
+		t.Errorf("int rename: expected %v, got %v", inInt, outInt)
+	}
+
+	if inInt8 != outInt8 {
+		t.Errorf("int8 rename: expected %v, got %v", inInt8, outInt8)
+	}
+
+	if inInt16 != outInt16 {
+		t.Errorf("int16 rename: expected %v, got %v", inInt16, outInt16)
+	}
+
+	if inInt32 != outInt32 {
+		t.Errorf("int32 rename: expected %v, got %v", inInt32, outInt32)
+	}
+
+	if inInt64 != outInt64 {
+		t.Errorf("int64 rename: expected %v, got %v", inInt64, outInt64)
+	}
+
+	if inUint != outUint {
+		t.Errorf("uint rename: expected %v, got %v", inUint, outUint)
+	}
+
+	if inUint8 != outUint8 {
+		t.Errorf("uint8 rename: expected %v, got %v", inUint8, outUint8)
+	}
+
+	if inUint16 != outUint16 {
+		t.Errorf("uint16 rename: expected %v, got %v", inUint16, outUint16)
+	}
+
+	if inUint32 != outUint32 {
+		t.Errorf("uint32 rename: expected %v, got %v", inUint32, outUint32)
+	}
+
+	if inUint64 != outUint64 {
+		t.Errorf("uint64 rename: expected %v, got %v", inUint64, outUint64)
+	}
+
+	if inString != outString {
+		t.Errorf("string rename: expected %v, got %v", inString, outString)
+	}
+
+	ensureConnValid(t, conn)
+}
+
+func TestRowDecode(t *testing.T) {
+	t.Parallel()
+
+	conn := mustConnect(t, *defaultConnConfig)
+	defer closeConn(t, conn)
+
+	tests := []struct {
+		sql      string
+		expected []interface{}
+	}{
+		{
+			"select row(1, 'cat', '2015-01-01 08:12:42'::timestamptz)",
+			[]interface{}{
+				int32(1),
+				"cat",
+				time.Date(2015, 1, 1, 8, 12, 42, 0, time.Local),
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		var actual []interface{}
+
+		err := conn.QueryRow(tt.sql).Scan(&actual)
+		if err != nil {
+			t.Errorf("%d. Unexpected failure: %v (sql -> %v)", i, err, tt.sql)
+			continue
+		}
+
+		if !reflect.DeepEqual(actual, tt.expected) {
+			t.Errorf("%d. Expected %v, got %v (sql -> %v)", i, tt.expected, actual, tt.sql)
+		}
+
+		ensureConnValid(t, conn)
 	}
 }

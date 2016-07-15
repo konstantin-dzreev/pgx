@@ -34,7 +34,7 @@ func (r *Row) Scan(dest ...interface{}) (err error) {
 
 // Rows is the result set returned from *Conn.Query. Rows must be closed before
 // the *Conn can be used again. Rows are closed by explicitly calling Close(),
-// calling Next() until it returns false, or when a fatal error occurs.
+// calling )() until it returns false, or when a fatal error occurs.
 type Rows struct {
 	conn       *Conn
 	mr         *msgReader
@@ -46,8 +46,6 @@ type Rows struct {
 	startTime  time.Time
 	sql        string
 	args       []interface{}
-	log        func(lvl int, msg string, ctx ...interface{})
-	shouldLog  func(lvl int) bool
 	afterClose func(*Rows)
 	unlockConn bool
 	closed     bool
@@ -70,12 +68,12 @@ func (rows *Rows) close() {
 	rows.closed = true
 
 	if rows.err == nil {
-		if rows.shouldLog(LogLevelInfo) {
+		if rows.conn.shouldLog(LogLevelInfo) {
 			endTime := time.Now()
-			rows.log(LogLevelInfo, "Query", "sql", rows.sql, "args", logQueryArgs(rows.args), "time", endTime.Sub(rows.startTime), "rowCount", rows.rowCount)
+			rows.conn.log(LogLevelInfo, "Query", "sql", rows.sql, "args", logQueryArgs(rows.args), "time", endTime.Sub(rows.startTime), "rowCount", rows.rowCount)
 		}
-	} else if rows.shouldLog(LogLevelError) {
-		rows.log(LogLevelError, "Query", "sql", rows.sql, "args", logQueryArgs(rows.args))
+	} else if rows.conn.shouldLog(LogLevelError) {
+		rows.conn.log(LogLevelError, "Query", "sql", rows.sql, "args", logQueryArgs(rows.args))
 	}
 
 	if rows.afterClose != nil {
@@ -157,6 +155,11 @@ func (rows *Rows) Fatal(err error) {
 func (rows *Rows) Next() bool {
 	if rows.closed {
 		return false
+	}
+
+	// Set query execution deadline
+	if timeoutTimer := rows.conn.startQueryExecTimeoutTimer(); timeoutTimer != nil {
+		defer timeoutTimer.Stop()
 	}
 
 	rows.rowCount++
@@ -301,7 +304,12 @@ func (rows *Rows) Scan(dest ...interface{}) (err error) {
 				rows.Fatal(scanArgError{col: i, err: err})
 			}
 		} else if vr.Type().DataType == JsonOid || vr.Type().DataType == JsonbOid {
-			decodeJSON(vr, &d)
+			// Because the argument passed to decodeJSON will escape the heap.
+			// This allows d to be stack allocated and only copied to the heap when
+			// we actually are decoding JSON. This saves one memory allocation per
+			// row.
+			d2 := d
+			decodeJSON(vr, &d2)
 		} else {
 			if err := Decode(vr, d); err != nil {
 				rows.Fatal(scanArgError{col: i, err: err})
@@ -428,13 +436,21 @@ func (rows *Rows) AfterClose(f func(*Rows)) {
 // from Query and handle it in *Rows.
 func (c *Conn) Query(sql string, args ...interface{}) (*Rows, error) {
 	c.lastActivityTime = time.Now()
-	rows := &Rows{conn: c, startTime: c.lastActivityTime, sql: sql, args: args, log: c.log, shouldLog: c.shouldLog}
+
+	rows := c.getRows(sql, args)
 
 	if err := c.lock(); err != nil {
 		rows.abort(err)
 		return rows, err
 	}
 	rows.unlockConn = true
+
+	// Set query execution deadline.
+	// Do it before making any write attempts. Otherwise it may hang forever if
+	// there is a connection issue.
+	if timeoutTimer := c.startQueryExecTimeoutTimer(); timeoutTimer != nil {
+		defer timeoutTimer.Stop()
+	}
 
 	ps, ok := c.preparedStatements[sql]
 	if !ok {
@@ -452,6 +468,22 @@ func (c *Conn) Query(sql string, args ...interface{}) (*Rows, error) {
 		rows.abort(err)
 	}
 	return rows, rows.err
+}
+
+func (c *Conn) getRows(sql string, args []interface{}) *Rows {
+	if len(c.preallocatedRows) == 0 {
+		c.preallocatedRows = make([]Rows, 64)
+	}
+
+	r := &c.preallocatedRows[len(c.preallocatedRows)-1]
+	c.preallocatedRows = c.preallocatedRows[0 : len(c.preallocatedRows)-1]
+
+	r.conn = c
+	r.startTime = c.lastActivityTime
+	r.sql = sql
+	r.args = args
+
+	return r
 }
 
 // QueryRow is a convenience wrapper over Query. Any error that occurs while

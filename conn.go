@@ -37,6 +37,7 @@ type ConnConfig struct {
 	LogLevel          int
 	Dial              DialFunc
 	RuntimeParams     map[string]string // Run-time parameters to set on connection as session default values (e.g. search_path or application_name)
+	QueryExecTimeout  time.Duration     // Max query/statement execution time
 }
 
 // Conn is a PostgreSQL connection handle. It is not safe for concurrent usage.
@@ -47,6 +48,7 @@ type Conn struct {
 	lastActivityTime   time.Time     // the last time the connection was used
 	reader             *bufio.Reader // buffered reader to improve read performance
 	wbuf               [1024]byte
+	writeBuf           WriteBuf
 	Pid                int32             // backend pid
 	SecretKey          int32             // key to use to send a cancel query message to the server
 	RuntimeParams      map[string]string // parameters that have been reported by the server
@@ -62,10 +64,11 @@ type Conn struct {
 	logLevel           int
 	mr                 msgReader
 	fp                 *fastpath
-	pgsql_af_inet      byte
-	pgsql_af_inet6     byte
+	pgsql_af_inet      *byte
+	pgsql_af_inet6     *byte
 	busy               bool
 	poolResetCount     int
+	preallocatedRows   []Rows
 }
 
 // PreparedStatement is a description of a prepared statement
@@ -74,6 +77,11 @@ type PreparedStatement struct {
 	SQL               string
 	FieldDescriptions []FieldDescription
 	ParameterOids     []Oid
+}
+
+// PrepareExOptions is an option struct that can be passed to PrepareEx
+type PrepareExOptions struct {
+	ParameterOids []Oid
 }
 
 // Notification is a message received from the PostgreSQL LISTEN/NOTIFY system
@@ -135,9 +143,33 @@ func (e ProtocolError) Error() string {
 // config.Host must be specified. config.User will default to the OS user name.
 // Other config fields are optional.
 func Connect(config ConnConfig) (c *Conn, err error) {
+	return connect(config, nil, nil, nil)
+}
+
+func connect(config ConnConfig, pgTypes map[Oid]PgType, pgsql_af_inet *byte, pgsql_af_inet6 *byte) (c *Conn, err error) {
 	c = new(Conn)
 
 	c.config = config
+
+	if pgTypes != nil {
+		c.PgTypes = make(map[Oid]PgType, len(pgTypes))
+		for k, v := range pgTypes {
+			c.PgTypes[k] = v
+		}
+	}
+
+	if pgsql_af_inet != nil {
+		c.pgsql_af_inet = new(byte)
+		*c.pgsql_af_inet = *pgsql_af_inet
+	}
+	if pgsql_af_inet6 != nil {
+		c.pgsql_af_inet6 = new(byte)
+		*c.pgsql_af_inet6 = *pgsql_af_inet6
+	}
+
+	if config.QueryExecTimeout < 0 {
+		return nil, errors.New("QueryExecTimeout must be equal to or greater than 0")
+	}
 
 	if c.config.LogLevel != 0 {
 		c.logLevel = c.config.LogLevel
@@ -281,14 +313,18 @@ func (c *Conn) connect(config ConnConfig, network, address string, tlsConfig *tl
 				c.log(LogLevelInfo, "Connection established")
 			}
 
-			err = c.loadPgTypes()
-			if err != nil {
-				return err
+			if c.PgTypes == nil {
+				err = c.loadPgTypes()
+				if err != nil {
+					return err
+				}
 			}
 
-			err = c.loadInetConstants()
-			if err != nil {
-				return err
+			if c.pgsql_af_inet == nil || c.pgsql_af_inet6 == nil {
+				err = c.loadInetConstants()
+				if err != nil {
+					return err
+				}
 			}
 
 			return nil
@@ -301,7 +337,14 @@ func (c *Conn) connect(config ConnConfig, network, address string, tlsConfig *tl
 }
 
 func (c *Conn) loadPgTypes() error {
-	rows, err := c.Query("select t.oid, t.typname from pg_type t where t.typtype='b'")
+	rows, err := c.Query(`select t.oid, t.typname
+from pg_type t
+left join pg_type base_type on t.typelem=base_type.oid
+where (
+	  t.typtype='b'
+	  and (base_type.oid is null or base_type.typtype='b')
+	)
+  or t.typname in('record');`)
 	if err != nil {
 		return err
 	}
@@ -334,8 +377,8 @@ func (c *Conn) loadInetConstants() error {
 		return err
 	}
 
-	c.pgsql_af_inet = ipv4[0]
-	c.pgsql_af_inet6 = ipv6[0]
+	c.pgsql_af_inet = &ipv4[0]
+	c.pgsql_af_inet6 = &ipv6[0]
 
 	return nil
 }
@@ -357,6 +400,56 @@ func (c *Conn) Close() (err error) {
 		c.log(LogLevelInfo, "Closed connection")
 	}
 	return err
+}
+
+// Kills current connection on the Postgres side.
+//
+// The method establishes a new connection to the DB and kills the orignal
+// connectiont.
+func (c *Conn) Kill() error {
+	if !c.IsAlive() {
+		return nil
+	}
+
+	killerConn, err := Connect(c.config)
+	if err != nil {
+		return err
+	}
+	defer killerConn.Close()
+
+	killerConn.config.QueryExecTimeout = 0
+	if _, err = killerConn.Exec("select pg_terminate_backend($1)", c.Pid); err != nil {
+		err = fmt.Errorf("Unable to kill backend PostgreSQL process: %v", err)
+	}
+
+	return err
+}
+
+// Starts a Query/Statement exec timeout if config.QueryExecTimeout is set.
+//
+// The timer should be stopped manually in the caller method to avoid false
+// timeout error to occur.
+//
+// FYI: Exec() and Query() may return different error messages:
+//   - conn.Exec():  "conn is dead"
+//   - conn.Query(): "FATAL: terminating connection due to administrator command (SQLSTATE 57P01)"
+func (c *Conn) startQueryExecTimeoutTimer() (timer *time.Timer) {
+	if c.config.QueryExecTimeout > 0 {
+		timer = time.AfterFunc(c.config.QueryExecTimeout, func() {
+			err := c.Kill()
+			// Close curent connection if Kill() happens to return an error.
+			// Most likely there was a low leven connection error.
+			if err != nil {
+				// To close current connection use c.die() instead of c.Close().
+				// C.Close() tries to rollback an openned transaction (if it is),
+				// but if there is a connection issue this may cause pgx code to hang
+				// until the remote host responds.
+				// C.die() does not do any high level voodoo, but closes the connection.
+				c.die(errors.New("QueryExecTimeout"))
+			}
+		})
+	}
+	return timer
 }
 
 // ParseURI parses a database URI into ConnConfig
@@ -557,6 +650,17 @@ func configSSL(sslmode string, cc *ConnConfig) error {
 // name and sql arguments. This allows a code path to Prepare and Query/Exec without
 // concern for if the statement has already been prepared.
 func (c *Conn) Prepare(name, sql string) (ps *PreparedStatement, err error) {
+	return c.PrepareEx(name, sql, nil)
+}
+
+// PrepareEx creates a prepared statement with name and sql. sql can contain placeholders
+// for bound parameters. These placeholders are referenced positional as $1, $2, etc.
+// It defers from Prepare as it allows additional options (such as parameter OIDs) to be passed via struct
+//
+// PrepareEx is idempotent; i.e. it is safe to call PrepareEx multiple times with the same
+// name and sql arguments. This allows a code path to PrepareEx and Query/Exec without
+// concern for if the statement has already been prepared.
+func (c *Conn) PrepareEx(name, sql string, opts *PrepareExOptions) (ps *PreparedStatement, err error) {
 	if name != "" {
 		if ps, ok := c.preparedStatements[name]; ok && ps.SQL == sql {
 			return ps, nil
@@ -575,7 +679,18 @@ func (c *Conn) Prepare(name, sql string) (ps *PreparedStatement, err error) {
 	wbuf := newWriteBuf(c, 'P')
 	wbuf.WriteCString(name)
 	wbuf.WriteCString(sql)
-	wbuf.WriteInt16(0)
+
+	if opts != nil {
+		if len(opts.ParameterOids) > 65535 {
+			return nil, errors.New(fmt.Sprintf("Number of PrepareExOptions ParameterOids must be between 0 and 65535, received %d", len(opts.ParameterOids)))
+		}
+		wbuf.WriteInt16(int16(len(opts.ParameterOids)))
+		for _, oid := range opts.ParameterOids {
+			wbuf.WriteInt32(int32(oid))
+		}
+	} else {
+		wbuf.WriteInt16(0)
+	}
 
 	// describe
 	wbuf.startMsg('D')
@@ -608,6 +723,7 @@ func (c *Conn) Prepare(name, sql string) (ps *PreparedStatement, err error) {
 		case parseComplete:
 		case parameterDescription:
 			ps.ParameterOids = c.rxParameterDescription(r)
+
 			if len(ps.ParameterOids) > 65535 && softErr == nil {
 				softErr = fmt.Errorf("PostgreSQL supports maximum of 65535 parameters, received %d", len(ps.ParameterOids))
 			}
@@ -814,6 +930,7 @@ func (c *Conn) sendQuery(sql string, arguments ...interface{}) (err error) {
 }
 
 func (c *Conn) sendSimpleQuery(sql string, args ...interface{}) error {
+
 	if len(args) == 0 {
 		wbuf := newWriteBuf(c, 'Q')
 		wbuf.WriteCString(sql)
@@ -855,7 +972,7 @@ func (c *Conn) sendPreparedQuery(ps *PreparedStatement, arguments ...interface{}
 			wbuf.WriteInt16(TextFormatCode)
 		default:
 			switch oid {
-			case BoolOid, ByteaOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, TimestampTzOid, TimestampTzArrayOid, TimestampOid, TimestampArrayOid, DateOid, BoolArrayOid, Int2ArrayOid, Int4ArrayOid, Int8ArrayOid, Float4ArrayOid, Float8ArrayOid, TextArrayOid, VarcharArrayOid, OidOid, InetOid, CidrOid, InetArrayOid, CidrArrayOid:
+			case BoolOid, ByteaOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, TimestampTzOid, TimestampTzArrayOid, TimestampOid, TimestampArrayOid, DateOid, BoolArrayOid, ByteaArrayOid, Int2ArrayOid, Int4ArrayOid, Int8ArrayOid, Float4ArrayOid, Float8ArrayOid, TextArrayOid, VarcharArrayOid, OidOid, InetOid, CidrOid, InetArrayOid, CidrArrayOid, RecordOid:
 				wbuf.WriteInt16(BinaryFormatCode)
 			default:
 				wbuf.WriteInt16(TextFormatCode)
@@ -901,6 +1018,11 @@ func (c *Conn) Exec(sql string, arguments ...interface{}) (commandTag CommandTag
 
 	startTime := time.Now()
 	c.lastActivityTime = startTime
+
+	// Set statement execution deadline
+	if timeoutTimer := c.startQueryExecTimeoutTimer(); timeoutTimer != nil {
+		defer timeoutTimer.Stop()
+	}
 
 	defer func() {
 		if err == nil {
