@@ -165,7 +165,7 @@ func connect(config ConnConfig, pgTypes map[Oid]PgType, pgsql_af_inet *byte, pgs
 	if pgsql_af_inet6 != nil {
 		c.pgsql_af_inet6 = new(byte)
 		*c.pgsql_af_inet6 = *pgsql_af_inet6
-
+	}
 	if config.QueryExecTimeout < 0 {
 		return nil, errors.New("QueryExecTimeout must be equal to or greater than 0")
 	}
