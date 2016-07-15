@@ -71,17 +71,26 @@ func NewRsConnPool(config ConnPoolConfig) (p *RsConnPool, err error) {
 
 // Acquire takes exclusive use of a connection until it is released.
 func (p *RsConnPool) Acquire() (*Conn, error) {
-	p.cond.L.Lock()
-	c, err := p.acquire(nil)
-	p.cond.L.Unlock()
-	return c, err
+	return p.acquire(nil, true)
 }
 
 // acquire performs acquision assuming pool is already locked
-func (p *RsConnPool) acquire(deadline *time.Time) (*Conn, error) {
+func (p *RsConnPool) acquire(deadline *time.Time, lock bool) (*Conn, error) {
+	var timer *time.Timer
+
+	if lock {
+		p.cond.L.Lock()
+		defer p.cond.L.Unlock()
+	}
+
 	if p.closed {
 		return nil, errors.New("cannot acquire from closed pool")
 	}
+
+	// Calculate initial timeout/deadline value. If the method (acquire) happens to
+	// recursively call itself the deadline should retain its value.
+	// Do this before any other slow jobs.
+	deadline = p.calcAcquireDeadline(deadline)
 
 	// A connection is available
 	if len(p.availableConnections) > 0 {
@@ -93,13 +102,28 @@ func (p *RsConnPool) acquire(deadline *time.Time) (*Conn, error) {
 
 	// No connections are available, but we can create more
 	if len(p.allConnections) < p.maxConnections {
+		placeholderConn := &Conn{}
+		p.allConnections = append(p.allConnections, placeholderConn)
+
+		p.cond.L.Unlock()
 		c, err := p.createConnection()
+		p.cond.L.Lock()
+		p.removeFromAllConnections(placeholderConn)
 		if err != nil {
 			return nil, err
 		}
-		c.poolResetCount = p.resetCount
-		p.allConnections = append(p.allConnections, c)
-		return c, nil
+
+		// If there is no room in the list of allConnections
+		// (Reset() may remove our placeholder), try to re-acquire
+		// the connection.
+		if len(p.allConnections) < p.maxConnections {
+			c.poolResetCount = p.resetCount
+			p.allConnections = append(p.allConnections, c)
+			return c, nil
+		}
+		// There is no room for the just created connection.
+		// Close it and try to re-acquire.
+		c.Close()
 	}
 
 	// All connections are in use and we cannot create more
@@ -107,29 +131,53 @@ func (p *RsConnPool) acquire(deadline *time.Time) (*Conn, error) {
 		p.logger.Warn("All connections in pool are busy - waiting...")
 	}
 
-	// Set initial timeout/deadline value. If the method (acquire) happens to
-	// recursively call itself the deadline should retain its value.
-	if deadline == nil && p.acquireTimeout > 0 {
-		tmp := time.Now().Add(p.acquireTimeout)
-		deadline = &tmp
-	}
-	// If there is a deadline then start a timeout timer
-	if deadline != nil {
-		timer := time.AfterFunc(deadline.Sub(time.Now()), func() {
-			p.cond.Signal()
-		})
-		defer timer.Stop()
-	}
-
 	// Wait until there is an available connection OR room to create a new connection
-	for len(p.availableConnections) == 0 && len(p.allConnections) == p.maxConnections {
-		if deadline != nil && time.Now().After(*deadline) {
-			return nil, errors.New("Timeout: All connections in pool are busy")
+	for p.canWaitToAcquireConnection(deadline) {
+		// If there is a deadline then start a timeout timer
+		if deadline != nil && timer == nil {
+			timer = time.AfterFunc(deadline.Sub(time.Now()), func() {
+				p.cond.Broadcast()
+			})
+			defer timer.Stop()
 		}
 		p.cond.Wait()
 	}
 
-	return p.acquire(deadline)
+	if p.deadlinePassed(deadline) {
+		return nil, errors.New("Timeout: All connections in pool are busy")
+	}
+	if timer != nil {
+		// Stop the timer when we do recursion
+		timer.Stop()
+	}
+	return p.acquire(deadline, false)
+}
+
+// canWaitToAcquireConnection returns true if we are good to try to acquire a connection:
+// - there is no deadline yet;
+// - there is no any free connection we can acquire.
+func (p *RsConnPool) canWaitToAcquireConnection(deadline *time.Time) bool {
+	noDeadlineYet := !p.deadlinePassed(deadline)
+	noConnections := (len(p.availableConnections) == 0) && (len(p.allConnections) == p.maxConnections)
+	return noDeadlineYet && noConnections
+}
+
+// calcAcquireDeadline returns deadline timestamp if there is an acquireTimeout
+// set in the config.
+func (p *RsConnPool) calcAcquireDeadline(deadline *time.Time) *time.Time {
+	if deadline != nil {
+		return deadline
+	}
+	if p.acquireTimeout <= 0 {
+		return nil
+	}
+	tmp := time.Now().Add(p.acquireTimeout)
+	return &tmp
+}
+
+// deadlinePassed returns true if the given deadline has passed.
+func (p *RsConnPool) deadlinePassed(deadline *time.Time) bool {
+	return deadline != nil && time.Now().After(*deadline)
 }
 
 // Release gives up use of a connection.
@@ -158,17 +206,22 @@ func (p *RsConnPool) Release(conn *Conn) {
 	if conn.IsAlive() {
 		p.availableConnections = append(p.availableConnections, conn)
 	} else {
-		ac := p.allConnections
-		for i, c := range ac {
-			if conn == c {
-				ac[i] = ac[len(ac)-1]
-				p.allConnections = ac[0 : len(ac)-1]
-				break
-			}
-		}
+		p.removeFromAllConnections(conn)
 	}
 	p.cond.L.Unlock()
 	p.cond.Signal()
+}
+
+// removeFromAllConnections Removes the given connection from the list.
+// It returns true if the connection was found and removed or false otherwise.
+func (p *RsConnPool) removeFromAllConnections(conn *Conn) bool {
+	for i, c := range p.allConnections {
+		if conn == c {
+			p.allConnections = append(p.allConnections[:i], p.allConnections[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // Close ends the use of a connection pool. It prevents any new connections
