@@ -1534,7 +1534,7 @@ func TestExecWithQueryExecTimeoutSet(t *testing.T) {
 	}
 
 	// It should close the timed out connection
-	if !conn1.IsAlive() {
+	if conn1.IsAlive() {
 		t.Fatal("Expected conn1.IsAlive to be false, instead it was true")
 	}
 
